@@ -1,0 +1,19 @@
+{
+  "threshold": 0.12999999523162842,
+  "accuracy": 0.7846,
+  "tpr": 0.7468,
+  "fpr": 0.1776,
+  "precision": 0.8078753786239723,
+  "eer_threshold": 0.11299999803304672,
+  "eer": 0.22089999999999999,
+  "same_mean": 0.2596612572669983,
+  "same_std": 0.18463025987148285,
+  "diff_mean": 0.016272300854325294,
+  "diff_std": 0.12552788853645325,
+  "checkpoint": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\runs\\tinyfacematch128_w05_v4_continue\\last.pt",
+  "data_dir": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\CASIA_subset_500x25",
+  "width_mult": 0.5,
+  "pairs": 10000,
+  "same_pairs": 5000,
+  "diff_pairs": 5000
+}

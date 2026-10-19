@@ -1,0 +1,19 @@
+# Vivado / Vitis scratch
+.Xil/
+*.jou
+*.log
+*.str
+*.cache/
+*.gen/
+*.runs/
+*.sim/
+*.ip_user_files/
+*.hw/
+# Python
+__pycache__/
+*.pyc
+.venv/
+# Training data (large, re-download) and scratch
+CASIA*/
+tinyfacenet/**/archive/
+.DS_Store

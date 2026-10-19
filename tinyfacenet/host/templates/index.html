@@ -1,0 +1,86 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>FPGA Based Face Authentication and HDMI Killswitch</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='app.css') }}">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="video-pane">
+        <div class="topbar">
+          <div>
+            <h1>FPGA Based Face Authentication and HDMI Killswitch</h1>
+            <p id="message">Waiting for service</p>
+          </div>
+          <div id="statePill" class="state-pill idle">IDLE</div>
+        </div>
+        <div class="video-wrap">
+          <img id="videoFeed" src="{{ url_for('video_feed') }}" alt="Live verification feed">
+        </div>
+      </section>
+
+      <aside class="control-pane">
+        <section class="panel verdict-panel">
+          <div class="label">Decision</div>
+          <div id="verdict" class="verdict idle">IDLE</div>
+          <div class="score-row">
+            <span>Score</span>
+            <strong id="score">--</strong>
+          </div>
+          <div class="meter">
+            <div id="scoreBar"></div>
+          </div>
+          <div class="score-row">
+            <span>Threshold</span>
+            <strong><span id="thresholdText">{{ (config.threshold * 100)|round|int }}</span>%</strong>
+          </div>
+        </section>
+
+        <section class="panel controls">
+          <button id="startBtn" class="primary">Start</button>
+          <button id="stopBtn">Stop</button>
+          <button id="reloadBtn">Reload Profiles</button>
+        </section>
+
+        <section class="panel enroll">
+          <div class="label">Enrollment</div>
+          <div class="field-row">
+            <input id="enrollName" value="me" autocomplete="off" aria-label="Enrollment name">
+            <input id="enrollSamples" type="number" min="1" max="20" value="3" aria-label="Enrollment samples">
+          </div>
+          <button id="enrollBtn" class="primary">Enroll Face</button>
+          <p id="enrollStatus">No enrollment in progress</p>
+        </section>
+
+        <section class="panel threshold">
+          <div class="label">Match Threshold</div>
+          <input id="thresholdSlider" type="range" min="0" max="100" step="1" value="{{ (config.threshold * 100)|round|int }}">
+        </section>
+
+        <section class="panel metrics">
+          <div class="label">Runtime</div>
+          <dl>
+            <div><dt>CNN</dt><dd id="cnnMs">--</dd></div>
+            <div><dt>Detect</dt><dd id="detectMs">--</dd></div>
+            <div><dt>Cosine</dt><dd id="cosineMs">--</dd></div>
+            <div><dt>Loop</dt><dd id="loopMs">--</dd></div>
+            <div><dt>FPS</dt><dd id="fps">--</dd></div>
+            <div><dt>Profiles</dt><dd id="profiles">--</dd></div>
+          </dl>
+        </section>
+
+        <section class="panel details">
+          <div class="label">Hardware</div>
+          <p><span>Bitstream</span><strong>{{ config.bitstream }}</strong></p>
+          <p><span>Weights</span><strong>{{ config.weights }}</strong></p>
+          <p><span>TFN IP</span><strong id="tfmIp">--</strong></p>
+          <p><span>Cosine IP</span><strong id="cosineIp">--</strong></p>
+        </section>
+      </aside>
+    </main>
+
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+  </body>
+</html>

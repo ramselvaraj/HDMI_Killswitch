@@ -1,0 +1,1427 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=0.85in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{array}
+\usepackage{amsmath}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{listings}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!50!black,
+  urlcolor=blue!50!black,
+  citecolor=blue!50!black
+}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{TinyFaceMatch FPGA Implementation}
+\rhead{\thepage}
+\setlength{\headheight}{14pt}
+
+\titleformat{\section}{\Large\bfseries}{\thesection}{0.6em}{}
+\titleformat{\subsection}{\large\bfseries}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}{\normalsize\bfseries}{\thesubsubsection}{0.6em}{}
+
+\lstdefinestyle{code}{
+  basicstyle=\ttfamily\small,
+  columns=fullflexible,
+  breaklines=true,
+  frame=single,
+  framerule=0.3pt,
+  rulecolor=\color{black!20},
+  backgroundcolor=\color{black!3},
+  xleftmargin=0.5em,
+  xrightmargin=0.5em
+}
+\lstset{style=code}
+
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\file}[1]{\path{#1}}
+\newcommand{\qformat}[1]{\texttt{#1}}
+
+\begin{document}
+
+\begin{titlepage}
+  \centering
+  \vspace*{1.2in}
+  {\Huge\bfseries TinyFaceMatch FPGA Implementation Report\par}
+  \vspace{0.35in}
+  {\Large A detailed implementation-level explanation of the PyTorch model, weight conversion, HLS accelerator, and PYNQ runtime\par}
+  \vspace{0.9in}
+  {\large Project root:\par}
+  \vspace{0.1in}
+  {\ttfamily /mnt/OS/ramse/hls4ml\_projects/tinyFaceNet\par}
+  \vfill
+  {\large Generated for the final DDR + integer-MAC HLS implementation\par}
+  \vspace{0.2in}
+  {\large May 2026\par}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{Purpose of This Report}
+
+This report explains the implementation from the point of view of someone who wants to understand what was built, why it was built this way, and how the code maps to the hardware behavior.
+It is not mainly a command reference.
+The important question here is not ``which command runs synthesis?'' but rather:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item What is the neural network doing?
+  \item What parts of the Python model survive into FPGA inference?
+  \item What does the weight conversion script actually change?
+  \item What is scratch memory, and why did the implementation need it?
+  \item How does the HLS C++ code turn a CNN into hardware?
+  \item Why did the final integer-MAC version become both faster and smaller?
+  \item What does the processor-side Python code do around the accelerator?
+\end{itemize}
+
+The final system is a face verification pipeline.
+It takes a face crop, converts it into a 112 by 112 RGB image, runs a compact CNN on the FPGA fabric, produces a 128-dimensional embedding vector, and compares that embedding against enrolled embeddings using cosine similarity.
+
+\section{End-to-End System View}
+
+\subsection{The Pipeline}
+
+The implementation is split into four conceptual layers:
+
+\begin{center}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\linewidth}
+                >{\raggedright\arraybackslash}p{0.34\linewidth}
+                >{\raggedright\arraybackslash}p{0.34\linewidth}}
+\toprule
+Layer & Responsibility & Main files \\
+\midrule
+Training side & Learn face-discriminative features from image folders. & \file{tinyfacematch_pytorch/model.py}, \file{data.py}, \file{train.py} \\
+Conversion side & Fold and quantize learned weights into a binary layout understood by HLS. & \file{tinyfacematch_pytorch/prepare_hls_weights.py} \\
+FPGA side & Execute the CNN forward pass using HLS-generated hardware. & \file{hls_ddr_intmac/tinyfacematch_ip.cpp}, \file{tinyfacematch_ip.hpp}, \file{weights_offsets.hpp} \\
+Processor side & Load bitstream, allocate memory, feed images, read embeddings, run camera/matching logic. & \file{scripts/pynq_hls_camera_verify.py}, notebook cells \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The most important design boundary is this:
+
+\begin{center}
+\fbox{\begin{minipage}{0.88\linewidth}
+The FPGA CNN IP does not know about cameras, identities, enrollment, files, or authorization.
+It only knows how to transform:
+\[
+  \text{112x112 RGB image} + \text{packed weights} + \text{scratch buffers}
+  \rightarrow
+  \text{128-D embedding}
+\]
+Everything else is handled by Python on the ARM processor.
+\end{minipage}}
+\end{center}
+
+\subsection{What ``Embedding'' Means}
+
+An embedding is a vector representation of a face.
+Instead of saying ``this image is class 17,'' the model outputs 128 numbers.
+Those 128 numbers are trained so that images of the same person produce nearby vectors, while images of different people produce vectors pointing in different directions.
+
+The final embedding is L2-normalized.
+That means its Euclidean length is 1:
+\[
+  \lVert e \rVert_2 = 1
+\]
+
+Once vectors are normalized, the dot product between two embeddings is also their cosine similarity:
+\[
+  \cos(a,b) = a \cdot b
+\]
+
+That is why verification can be implemented as:
+
+\begin{lstlisting}
+score = dot(camera_embedding, authorized_embedding)
+if score >= threshold:
+    MATCH
+else:
+    NOT MATCH
+\end{lstlisting}
+
+The CNN does not directly output ``match'' or ``not match.''
+It outputs an embedding.
+Matching is a separate step.
+
+\section{Repository Components}
+
+\subsection{PyTorch Implementation Files}
+
+\begin{description}[leftmargin=2.7em,style=nextline]
+  \item[\code{tinyfacematch\_pytorch/model.py}]
+  Defines the neural network architecture.
+  The core inference model is \code{TinyFaceMatch128}.
+  The training wrapper is \code{TinyFaceMatchTrainingModel}, which adds an ArcFace classifier during training only.
+
+  \item[\code{tinyfacematch\_pytorch/data.py}]
+  Defines the folder-based dataset loader.
+  It reads identity folders, loads RGB images, resizes them to 112 by 112, and normalizes pixels with:
+  \[
+    x = \frac{\text{pixel} - 127.5}{128.0}
+  \]
+
+  \item[\code{tinyfacematch\_pytorch/train.py}]
+  Implements training.
+  It creates train/validation splits, runs the optimizer, uses ArcFace-style logits, saves checkpoints, and records metrics.
+
+  \item[\code{tinyfacematch\_pytorch/prepare\_hls\_weights.py}]
+  Converts a PyTorch checkpoint into the exact packed integer format used by the HLS design.
+  This is the bridge between machine learning code and FPGA inference code.
+
+  \item[\code{tinyfacematch\_pytorch/eval\_hls\_prepared.py}]
+  Replays the quantized/folded network in PyTorch.
+  This makes it possible to check whether the prepared HLS weights still behave like the original trained model before putting the design on hardware.
+\end{description}
+
+\subsection{HLS Implementation Files}
+
+\begin{description}[leftmargin=2.7em,style=nextline]
+  \item[\code{hls\_ddr\_intmac/tinyfacematch\_ip.hpp}]
+  Declares constants, fixed-point types, and the top-level HLS function.
+  This file tells Vitis HLS the C++ signature of the accelerator.
+
+  \item[\code{hls\_ddr\_intmac/tinyfacematch\_ip.cpp}]
+  Contains the actual CNN implementation.
+  It defines the top AXI interfaces, helper functions for quantized arithmetic, convolution kernels, depthwise kernels, dense output logic, and the hard-coded layer execution order.
+
+  \item[\code{hls\_ddr\_intmac/weights\_offsets.hpp}]
+  Generated header containing byte offsets for each layer's parameters inside \code{weights.bin}.
+  The HLS code uses these offsets to find each layer's weights, biases, and PReLU parameters.
+
+  \item[\code{hls\_ddr\_intmac/testbench.cpp}]
+  C simulation testbench.
+  It loads a known input, runs the HLS top function, and compares the output against an expected vector.
+\end{description}
+
+\subsection{Processor-Side Runtime Files}
+
+\begin{description}[leftmargin=2.7em,style=nextline]
+  \item[\code{scripts/pynq\_hls\_camera\_verify.py}]
+  Shows the complete runtime pattern on PYNQ:
+  load overlay, allocate buffers, write physical addresses into HLS registers, prepare face crops, start the IP, wait for completion, read the output embedding, and compare against an enrolled profile.
+
+  \item[Notebook cells]
+  During testing, notebook cells used the same ideas as the script but were adjusted for live DroidCam input, dummy latency tests, and the separate cosine-similarity IP.
+\end{description}
+
+\section{The Neural Network Architecture}
+
+\subsection{Why This Model Shape Was Chosen}
+
+The model is not a large face recognition network.
+It is a compact embedding network designed to fit on a small FPGA, especially a Zynq-7020 class device.
+That means the architecture has to balance:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item accuracy good enough for face verification,
+  \item a small number of channels,
+  \item mostly convolution operations that can be expressed predictably in HLS,
+  \item low enough LUT/FF/BRAM usage to place in Vivado,
+  \item a fixed input size so the HLS implementation can be static.
+\end{itemize}
+
+The inference model is \code{TinyFaceMatch128}.
+It accepts one RGB face image with shape:
+\[
+  112 \times 112 \times 3
+\]
+and produces:
+\[
+  128
+\]
+embedding values.
+
+\subsection{Important Building Blocks}
+
+\subsubsection{Standard Convolution}
+
+A convolution layer slides a small filter over the image or feature map.
+For every output pixel, it multiplies nearby input values by learned weights and sums them.
+In simplified form:
+\[
+  y[o,y,x] =
+  b[o] + \sum_{i,ky,kx}
+  x[i,y+ky,x+kx] \cdot w[o,i,ky,kx]
+\]
+
+The first layer, \code{conv0}, is a normal 3 by 3 convolution.
+It converts raw RGB pixels into 16 feature channels and also downsamples the image from 112 by 112 to 56 by 56.
+
+\subsubsection{Depthwise Convolution}
+
+A depthwise convolution is a cheaper form of convolution.
+Instead of mixing all input channels into all output channels, each channel gets its own spatial filter.
+
+For example, if there are 64 channels, a 3 by 3 depthwise convolution uses 64 separate 3 by 3 filters.
+Channel 0 only filters channel 0, channel 1 only filters channel 1, and so on.
+It captures local spatial patterns but does not mix information between channels.
+
+This is cheaper than a full convolution because the number of multiplies is much smaller.
+The tradeoff is that another layer is needed to mix channels.
+
+\subsubsection{Pointwise 1 by 1 Convolution}
+
+A pointwise convolution is a 1 by 1 convolution.
+It looks at one spatial location at a time and mixes the channels at that location.
+
+If the input at one pixel is a vector of 64 channels, a 1 by 1 convolution computes new channel vectors by matrix-vector multiplication.
+This is how the model changes channel count and combines information after depthwise filtering.
+
+\subsubsection{Depthwise-Separable Block}
+
+A depthwise-separable block combines:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item a depthwise 3 by 3 convolution for spatial filtering,
+  \item a pointwise 1 by 1 convolution for channel mixing.
+\end{enumerate}
+
+This is much cheaper than a full 3 by 3 convolution that mixes all input channels into all output channels at every spatial position.
+
+\subsubsection{Residual Bottleneck Block}
+
+A residual bottleneck block has:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item \textbf{expand 1 by 1 convolution:} increase channel count,
+  \item \textbf{depthwise 3 by 3 convolution:} spatial filtering,
+  \item \textbf{project 1 by 1 convolution:} reduce channel count back down,
+  \item \textbf{optional residual add:} add the original input back to the block output.
+\end{enumerate}
+
+The residual connection is only used when input and output have the same shape.
+For example, a block that maps 28 by 28 by 32 to 28 by 28 by 32 can add its input to its output.
+A block that changes resolution or channel count cannot do that directly.
+
+Residuals help training because the block can learn a correction to the input rather than learning the whole transformation from scratch.
+
+\subsubsection{BatchNorm and PReLU}
+
+During training, many convolution layers are followed by BatchNorm and PReLU.
+
+BatchNorm stores learned scale and shift parameters, plus running mean and variance.
+At inference time, BatchNorm is just a linear transformation:
+\[
+  y = \gamma \frac{x - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta
+\]
+Because it is linear, it can be folded into the previous convolution weights and biases.
+That means the FPGA does not need a separate BatchNorm hardware stage.
+
+PReLU is an activation function:
+\[
+  y =
+  \begin{cases}
+    x, & x \ge 0 \\
+    \alpha x, & x < 0
+  \end{cases}
+\]
+Unlike ReLU, which clips negative values to zero, PReLU keeps a scaled negative value.
+The learned \(\alpha\) values are exported as part of the packed weights.
+
+\subsection{Layer-by-Layer Shape Flow}
+
+The final implementation hard-codes this network flow.
+The table below uses height by width by channels.
+
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.22\linewidth}
+                  >{\raggedright\arraybackslash}p{0.21\linewidth}
+                  >{\raggedright\arraybackslash}p{0.18\linewidth}
+                  >{\raggedright\arraybackslash}p{0.27\linewidth}}
+\toprule
+Stage & Operation & Output shape & Implementation idea \\
+\midrule
+\endhead
+Input & RGB face crop & 112 x 112 x 3 & uint8 image in DDR \\
+conv0 & 3x3 stride-2 conv + PReLU & 56 x 56 x 16 & \code{run\_conv\_image} \\
+dwsep0\_dw & 3x3 depthwise & 56 x 56 x 16 & \code{run\_depthwise} \\
+dwsep0\_pw & 1x1 pointwise & 56 x 56 x 32 & \code{run\_conv1x1} \\
+b0 expand & 1x1 conv & 56 x 56 x 64 & \code{run\_conv1x1} \\
+b0 depthwise & 3x3 stride-2 depthwise & 28 x 28 x 64 & \code{run\_depthwise} \\
+b0 project & 1x1 conv & 28 x 28 x 32 & no residual \\
+b1 & bottleneck & 28 x 28 x 32 & residual add \\
+b2 & bottleneck & 28 x 28 x 32 & residual add \\
+b3 & stride-2 bottleneck & 14 x 14 x 64 & no residual \\
+b4 & bottleneck & 14 x 14 x 64 & residual add \\
+b5 & bottleneck & 14 x 14 x 64 & residual add \\
+b6 & stride-2 bottleneck & 7 x 7 x 64 & no residual \\
+b7 & bottleneck & 7 x 7 x 64 & residual add \\
+conv\_final & 1x1 conv & 7 x 7 x 128 & channel expansion \\
+global\_dw7 & 7x7 depthwise & 1 x 1 x 128 & spatial collapse \\
+dense & linear + L2 normalize & 128 & final embedding \\
+\bottomrule
+\end{longtable}
+
+\section{Training-Side Design}
+
+\subsection{Dataset Format}
+
+The training dataset is folder-per-identity.
+Conceptually:
+
+\begin{lstlisting}
+data_root/
+  person_000/
+    image1.jpg
+    image2.jpg
+  person_001/
+    image1.jpg
+    image2.jpg
+\end{lstlisting}
+
+\code{FaceFolderDataset} assigns each identity folder a numeric label.
+Every image is:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item opened as RGB,
+  \item optionally augmented,
+  \item resized to 112 by 112,
+  \item converted to float32,
+  \item normalized with \((pixel - 127.5) / 128.0\),
+  \item returned in CHW layout for PyTorch.
+\end{enumerate}
+
+CHW means channels-height-width.
+PyTorch convolution layers usually expect:
+\[
+  N \times C \times H \times W
+\]
+where \(N\) is batch size.
+
+\subsection{Training Model Versus Inference Model}
+
+During training, the model is:
+\[
+  \text{backbone} + \text{ArcFace classifier}
+\]
+
+The backbone is the CNN that produces embeddings.
+The ArcFace classifier is only a training tool.
+It forces embeddings of the same identity to cluster together and embeddings of different identities to separate angularly.
+
+Only the backbone is exported to FPGA.
+The classifier is not needed at runtime because runtime verification compares embeddings with cosine similarity.
+
+\subsection{Why ArcFace Is Used}
+
+Normal classification training asks the model to predict an identity class.
+That is useful, but face verification needs a geometry where distances between embeddings are meaningful.
+ArcFace encourages this by applying an angular margin.
+
+In plain terms:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item same-person embeddings are pushed closer together,
+  \item different-person embeddings are pushed farther apart,
+  \item the final embedding space becomes useful for cosine similarity.
+\end{itemize}
+
+The FPGA does not implement ArcFace.
+ArcFace only shapes the embedding space during training.
+
+\section{Weight Preparation}
+
+\subsection{Why Weights Need a Conversion Step}
+
+The PyTorch checkpoint cannot be consumed directly by the HLS IP.
+The checkpoint contains PyTorch tensors, BatchNorm modules, floating-point values, and module names.
+The FPGA design expects one flat array of integer words called \code{weights.bin}.
+
+The conversion step transforms:
+
+\begin{center}
+\code{PyTorch checkpoint} \(\rightarrow\)
+\code{folded fp32 arrays} \(\rightarrow\)
+\code{quantized integer arrays} \(\rightarrow\)
+\code{packed weights.bin + offsets header}
+\end{center}
+
+\subsection{BatchNorm Folding}
+
+BatchNorm folding is one of the most important transformations.
+During inference, a convolution followed by BatchNorm can be replaced by a single convolution with adjusted weights and bias.
+
+For a convolution output:
+\[
+  z = W x + b
+\]
+BatchNorm applies:
+\[
+  y = \gamma \frac{z - \mu}{\sqrt{\sigma^2 + \epsilon}} + \beta
+\]
+
+This can be rewritten as:
+\[
+  y = W' x + b'
+\]
+where:
+\[
+  W' = W \cdot \frac{\gamma}{\sqrt{\sigma^2 + \epsilon}}
+\]
+and:
+\[
+  b' = \beta + (b - \mu)\frac{\gamma}{\sqrt{\sigma^2 + \epsilon}}
+\]
+
+After this transformation, there is no separate BatchNorm layer in HLS.
+That saves hardware and simplifies the runtime flow.
+
+\subsection{Quantization}
+
+Quantization means storing real numbers as scaled integers.
+For example, a value \(x = 0.25\) with 12 fractional bits becomes:
+\[
+  \text{integer} = round(0.25 \cdot 2^{12}) = 1024
+\]
+
+To recover the approximate real value:
+\[
+  x \approx \frac{1024}{2^{12}} = 0.25
+\]
+
+The final implementation uses:
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+Quantity & Stored type & Fraction bits & Meaning \\
+\midrule
+Weights & int16 & 12 & learned convolution/dense weights \\
+Biases & int32 & 20 & folded convolution/dense biases \\
+PReLU alpha & int16 & 12 & learned negative-slope values \\
+Intermediate activations & int16 & 10 & feature maps between layers \\
+Output embedding & int16 & 14 & normalized 128-D output \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The notation Q6.10 is useful here.
+It means a fixed-point number with 16 total bits, 6 integer/sign bits, and 10 fractional bits.
+The HLS activation type \code{ap\_fixed<16,6>} corresponds to that idea.
+
+\subsection{Packed Weight Layout}
+
+The final \code{weights.bin} file is a flat sequence of 16-bit words.
+For each layer, the data is packed in this order:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item quantized weights,
+  \item quantized biases,
+  \item optional PReLU alpha values.
+\end{enumerate}
+
+Biases are int32, but the memory bus and weight stream are int16 words.
+So each int32 bias is stored as two int16 words.
+The HLS helper \code{read\_i32\_words} reconstructs the int32 value from the two 16-bit pieces.
+
+\code{weights\_offsets.hpp} tells HLS where each layer begins inside the packed array.
+For example:
+
+\begin{lstlisting}
+static constexpr int TFM_CONV0_OFFSET_BYTES = 0;
+static constexpr int TFM_DWSEP0_DW_OFFSET_BYTES = 960;
+...
+static constexpr int TFM_DENSE_OFFSET_BYTES = 225408;
+\end{lstlisting}
+
+The top-level HLS code divides byte offsets by 2 because the \code{weights} pointer is an \code{ap\_int<16>*}.
+One address step is one 16-bit word, not one byte.
+
+\section{What Scratch Memory Means}
+
+\subsection{The Simple Definition}
+
+Scratch memory is temporary workspace.
+It is not model weights.
+It is not final output.
+It is the memory used to hold intermediate feature maps while the CNN is running.
+
+A CNN is a sequence of layers.
+Each layer consumes one tensor and produces another tensor.
+For example:
+
+\[
+  \text{conv0 output} = 56 \times 56 \times 16
+\]
+
+That output must be stored somewhere because the next layer needs to read it.
+That ``somewhere'' is scratch memory.
+
+\subsection{Why Scratch Memory Is Needed}
+
+The model is not just one operation.
+It is a chain:
+
+\begin{center}
+\code{image} \(\rightarrow\)
+\code{conv0 output} \(\rightarrow\)
+\code{dwsep0 output} \(\rightarrow\)
+\code{bottleneck outputs} \(\rightarrow\)
+\code{embedding}
+\end{center}
+
+Every arrow produces intermediate data.
+These intermediate tensors are too large to keep entirely in local FPGA registers.
+Some examples:
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Tensor shape & int16 words & Approx bytes \\
+\midrule
+56 x 56 x 16 & 50,176 & 100 KB \\
+56 x 56 x 32 & 100,352 & 201 KB \\
+56 x 56 x 64 & 200,704 & 401 KB \\
+28 x 28 x 64 & 50,176 & 100 KB \\
+14 x 14 x 128 & 25,088 & 50 KB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The largest intermediate tensor in the implemented network is:
+\[
+  64 \times 56 \times 56 = 200704 \text{ int16 words}
+\]
+Since each int16 is 2 bytes:
+\[
+  200704 \times 2 = 401408 \text{ bytes}
+\]
+So one large scratch buffer is about 401 KB.
+
+\subsection{Why Not Put All Scratch Memory On-Chip?}
+
+The Zynq-7020 FPGA fabric has limited BRAM.
+BRAM is fast on-chip block RAM, but there is not enough of it to store all intermediate CNN tensors naively.
+
+The early HLS designs tried to keep too much tensor storage inside the fabric.
+That caused over-utilization in Vivado.
+The original resource reports showed the design needing far more LUTs, flip-flops, muxes, and BRAM than the device had.
+That is why place design failed.
+
+The solution was to move large intermediate tensors into external DDR memory.
+DDR is slower than BRAM, but much larger.
+On a PYNQ/Zynq board, DDR is shared between the ARM processor and programmable logic.
+The HLS IP accesses DDR through AXI master ports.
+
+\subsection{Why There Are Three Scratch Buffers}
+
+The final top function receives:
+
+\begin{lstlisting}
+ap_int<16>* scratch0
+ap_int<16>* scratch1
+ap_int<16>* scratch2
+\end{lstlisting}
+
+These are three temporary tensor buffers in DDR.
+They are reused throughout the network.
+
+The implementation does not allocate a separate buffer for every layer.
+That would waste memory.
+Instead, it ping-pongs between scratch buffers.
+
+For example:
+
+\begin{lstlisting}
+run_conv_image(image_rgb, scratch0, ...)
+run_depthwise(scratch0, scratch1, ...)
+run_conv1x1(scratch1, scratch0, ...)
+\end{lstlisting}
+
+This means:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item layer 1 writes to \code{scratch0},
+  \item layer 2 reads \code{scratch0} and writes \code{scratch1},
+  \item layer 3 reads \code{scratch1} and writes back to \code{scratch0}.
+\end{itemize}
+
+\code{scratch2} is useful for bottleneck blocks because some blocks need an input tensor preserved for residual addition while another intermediate tensor is being computed.
+
+\subsection{Scratch Memory Versus Cache}
+
+Scratch memory and cache are not the same thing.
+
+\begin{description}[leftmargin=2.8em,style=nextline]
+  \item[Scratch memory]
+  Explicit temporary memory that the program controls.
+  In this project, the Python runtime allocates scratch buffers, passes their physical addresses to the IP, and the HLS code reads/writes them directly.
+
+  \item[Cache]
+  Hardware-managed memory used automatically to speed up repeated reads.
+  The programmer usually does not address cache directly.
+\end{description}
+
+In this project, scratch buffers are intentional, visible parts of the hardware/software contract.
+
+\section{HLS Top-Level Interface}
+
+\subsection{What HLS Does}
+
+HLS means High-Level Synthesis.
+Instead of writing Verilog manually, the design is written in C++ with HLS-specific types and pragmas.
+Vitis HLS converts that C++ into RTL hardware.
+
+The top function:
+
+\begin{lstlisting}
+void tinyfacematch_ip(
+    const ap_uint<8>* image_rgb,
+    const ap_int<16>* weights,
+    ap_int<16>* scratch0,
+    ap_int<16>* scratch1,
+    ap_int<16>* scratch2,
+    ap_int<16>* embedding_out
+);
+\end{lstlisting}
+
+becomes an IP block in Vivado.
+
+\subsection{Top Function Arguments}
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+Argument & Direction & Meaning \\
+\midrule
+\code{image\_rgb} & input & flattened 112 x 112 x 3 uint8 RGB image \\
+\code{weights} & input & packed quantized model weights \\
+\code{scratch0} & temporary read/write & DDR workspace for feature maps \\
+\code{scratch1} & temporary read/write & DDR workspace for feature maps \\
+\code{scratch2} & temporary read/write & DDR workspace for feature maps/residuals \\
+\code{embedding\_out} & output & 128 int16 output embedding values \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{AXI-Lite Control}
+
+AXI-Lite is a simple memory-mapped register interface.
+The processor uses it to configure and control the IP.
+
+In this design, AXI-Lite is used for:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item writing the physical address of \code{image\_rgb},
+  \item writing the physical address of \code{weights},
+  \item writing the physical addresses of \code{scratch0}, \code{scratch1}, and \code{scratch2},
+  \item writing the physical address of \code{embedding\_out},
+  \item starting the IP,
+  \item polling until the IP is done.
+\end{itemize}
+
+The Python code writes addresses into offsets such as:
+
+\begin{lstlisting}
+IMAGE_OFFSET    = 0x10
+WEIGHTS_OFFSET  = 0x1C
+SCRATCH0_OFFSET = 0x28
+SCRATCH1_OFFSET = 0x34
+SCRATCH2_OFFSET = 0x40
+OUT_OFFSET      = 0x4C
+\end{lstlisting}
+
+The control register at offset \code{0x00} contains bits such as \code{ap\_start} and \code{ap\_done}.
+
+\subsection{AXI Master Memory Ports}
+
+AXI master ports let the IP initiate reads and writes to DDR.
+That is how the accelerator reads images and weights and writes scratch tensors.
+
+The HLS pragmas look like:
+
+\begin{lstlisting}
+#pragma HLS INTERFACE m_axi port=image_rgb    bundle=gmem0
+#pragma HLS INTERFACE m_axi port=weights      bundle=gmem1
+#pragma HLS INTERFACE m_axi port=scratch0     bundle=gmem2
+#pragma HLS INTERFACE m_axi port=scratch1     bundle=gmem2
+#pragma HLS INTERFACE m_axi port=scratch2     bundle=gmem2
+#pragma HLS INTERFACE m_axi port=embedding_out bundle=gmem2
+\end{lstlisting}
+
+The important idea:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item AXI-Lite passes addresses and control bits.
+  \item AXI master ports move the actual bulk data.
+\end{itemize}
+
+\section{Quantized Arithmetic in the Final HLS Version}
+
+\subsection{Why the Integer-MAC Version Exists}
+
+Earlier HLS versions used fixed-point values more directly inside convolution loops.
+That was correct, but the generated hardware was heavier than necessary.
+
+The final version recognizes that convolution inputs and weights are already stored as integers:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item activations are stored as int16 with 10 fractional bits,
+  \item weights are stored as int16 with 12 fractional bits,
+  \item biases are stored as int32 with 20 fractional bits.
+\end{itemize}
+
+Therefore, a convolution multiply can be done as an integer multiply:
+
+\[
+  \text{act\_q10} \times \text{weight\_q12}
+  =
+  \text{acc\_q22}
+\]
+
+The result has:
+\[
+  10 + 12 = 22
+\]
+fractional bits.
+
+Bias has 20 fractional bits, so the code shifts the bias left by 2 bits to align it with Q22:
+
+\[
+  \text{bias\_q22} = \text{bias\_q20} << 2
+\]
+
+After accumulation, the result is shifted down by 12 bits to return to activation Q10:
+
+\[
+  \text{out\_q10} = round(\text{acc\_q22} / 2^{12})
+\]
+
+This is exactly why the helper is named:
+
+\begin{lstlisting}
+round_shift_sat_i16(acc, TFM_WEIGHT_FRAC_BITS)
+\end{lstlisting}
+
+Since \code{TFM\_WEIGHT\_FRAC\_BITS = 12}, it removes the weight fractional scale after multiplication.
+
+\subsection{Saturation}
+
+Saturation means clamping a value to the valid int16 range.
+The valid range is:
+\[
+  -32768 \le x \le 32767
+\]
+
+If an accumulated result is too large, it becomes 32767.
+If it is too negative, it becomes -32768.
+
+This avoids wraparound.
+Wraparound would be disastrous because a large positive value could become a negative value just because of integer overflow.
+
+\subsection{Input Pixel Normalization in Hardware}
+
+The training input normalization is:
+\[
+  x = \frac{pixel - 127.5}{128.0}
+\]
+
+The HLS activation format uses 10 fractional bits.
+So the hardware wants:
+\[
+  x\_q10 = x \cdot 2^{10}
+\]
+
+Substitute:
+\[
+  x\_q10 =
+  \frac{pixel - 127.5}{128.0} \cdot 1024
+\]
+
+Since \(1024 / 128 = 8\):
+\[
+  x\_q10 = pixel \cdot 8 - 127.5 \cdot 8
+\]
+\[
+  x\_q10 = pixel \cdot 8 - 1020
+\]
+
+That is why the HLS code uses:
+
+\begin{lstlisting}
+return (ap_int<16>)(pixel * 8 - 1020);
+\end{lstlisting}
+
+This is a nice example of replacing floating-point preprocessing with exact integer arithmetic.
+
+\section{HLS Kernel Implementation}
+
+\subsection{\code{run\_conv\_image}}
+
+\code{run\_conv\_image} handles the first convolution.
+It is special because its input is not an int16 feature map yet.
+Its input is raw uint8 RGB image data.
+
+Responsibilities:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item read RGB pixels,
+  \item convert them into Q10 normalized activations,
+  \item apply 3 by 3 convolution,
+  \item apply folded bias,
+  \item shift result back to Q10,
+  \item apply PReLU,
+  \item write a 56 x 56 x 16 output tensor to scratch memory.
+\end{itemize}
+
+The kernel caches one output channel's 3 by 3 by 3 weights locally:
+
+\begin{lstlisting}
+ap_int<16> w_cache[3 * 3 * 3];
+\end{lstlisting}
+
+This is small.
+Caching it avoids repeatedly fetching the same weights from DDR for every output pixel.
+
+\subsection{\code{run\_depthwise}}
+
+\code{run\_depthwise} handles both ordinary 3 by 3 depthwise layers and the final 7 by 7 global depthwise layer.
+
+For each channel, it:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item loads that channel's kernel weights into a small local cache,
+  \item reads the matching input channel from scratch memory,
+  \item applies the spatial convolution,
+  \item adds bias,
+  \item optionally applies PReLU,
+  \item writes the output channel.
+\end{enumerate}
+
+Depthwise convolution is efficient because it does not loop over every input channel for every output channel.
+It only processes one input channel for one output channel.
+
+\subsection{\code{run\_conv1x1}}
+
+\code{run\_conv1x1} implements pointwise convolutions.
+These are important because most channel mixing in the network happens here.
+
+At each spatial location, a 1 by 1 convolution is essentially:
+\[
+  \text{output vector} = W \cdot \text{input vector} + b
+\]
+
+The implementation processes two output channels at a time:
+
+\begin{lstlisting}
+for (int oc = 0; oc < out_c; oc += 2) {
+    ap_int<16> w_cache0[TFM_MAX_CHANNELS];
+    ap_int<16> w_cache1[TFM_MAX_CHANNELS];
+    ...
+}
+\end{lstlisting}
+
+This gives more parallel work per input read.
+For one input channel value, the code updates two accumulators:
+
+\begin{lstlisting}
+acc0 += in_value * w_cache0[ic];
+acc1 += in_value * w_cache1[ic];
+\end{lstlisting}
+
+This costs more multipliers than a one-output-channel loop, but it reduces repeated input memory reads and improves latency.
+The final design still fit the FPGA after this because the integer-MAC rewrite reduced LUT pressure.
+
+\subsection{Residual Add Inside \code{run\_conv1x1}}
+
+Some project layers are the end of residual bottleneck blocks.
+For those layers, the output of the project convolution is added to the original block input.
+
+The HLS function supports this with:
+
+\begin{lstlisting}
+bool add_residual
+\end{lstlisting}
+
+When enabled:
+
+\begin{lstlisting}
+out0 = add_q10_sat(out0, read_act_raw(residual, oc, oy, ox, ...));
+\end{lstlisting}
+
+Both tensors are already Q10 activations, so the add does not need rescaling.
+It only needs saturation.
+
+\subsection{\code{run\_dense\_l2}}
+
+\code{run\_dense\_l2} is the final stage.
+It reads the 1 by 1 by 128 tensor after the global depthwise layer, applies the 128 by 128 dense layer, and normalizes the result.
+
+This stage still uses fixed-point helper types rather than pure integer MAC everywhere.
+That is acceptable because the dense stage is not the main runtime bottleneck compared with the convolutional body.
+
+The final output is quantized with 14 fractional bits:
+\[
+  \text{embedding\_int16} = round(\text{embedding\_float} \cdot 2^{14})
+\]
+
+The processor-side Python code divides by \(2^{14}\) and normalizes again for safety.
+
+\section{The Hard-Coded Layer Schedule}
+
+\subsection{Why It Is Hard-Coded}
+
+The HLS implementation is not a general neural network interpreter.
+It does not parse ONNX.
+It does not read a dynamic graph.
+It is a static accelerator for this one network architecture.
+
+That is intentional.
+A static schedule lets HLS optimize loops and memory access patterns.
+It also avoids building hardware for features the design does not need.
+
+The top function calls kernels in the exact network order:
+
+\begin{lstlisting}
+run_conv_image(...);
+run_depthwise(...);
+run_conv1x1(...);
+
+run_conv1x1(...);  // b0 expand
+run_depthwise(...); // b0 depthwise
+run_conv1x1(...);  // b0 project
+
+...
+
+run_conv1x1(...);  // conv_final
+run_depthwise(...); // global_dw7
+run_dense_l2(...);
+\end{lstlisting}
+
+Each call passes:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item input scratch pointer,
+  \item output scratch pointer,
+  \item residual pointer if needed,
+  \item channel count,
+  \item spatial size,
+  \item stride/padding/kernel parameters,
+  \item packed-weight offset,
+  \item whether PReLU is present,
+  \item whether residual addition is present.
+\end{itemize}
+
+\subsection{Why This Beats a Generic Layer Runner}
+
+A generic implementation would have to store layer descriptors, switch between operation types, handle arbitrary shapes, and make conservative assumptions.
+That flexibility costs hardware.
+
+This implementation chooses the opposite tradeoff:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item less flexible,
+  \item much simpler hardware,
+  \item predictable resource use,
+  \item easier to debug against the PyTorch architecture,
+  \item good fit for one deployed model.
+\end{itemize}
+
+\section{Why the First Designs Failed and the Final One Worked}
+
+\subsection{The Original Resource Problem}
+
+The early HLS implementation was correct enough for simulation, but too large for the target device.
+Vivado reported over-utilization in LUTs, flip-flops, muxes, carry chains, and BRAM.
+
+That means the design did not fail because of a syntax problem.
+It failed because the generated hardware physically could not fit.
+
+The core issue was that HLS was mapping too much tensor storage and fixed-point computation into fabric resources.
+CNN intermediate tensors are large, and a naive hardware mapping can explode quickly.
+
+\subsection{First Major Fix: DDR Scratch Buffers}
+
+The first viability fix was to move intermediate tensors to DDR scratch buffers.
+
+Before:
+
+\begin{center}
+large intermediate tensors \(\rightarrow\) mostly on-chip storage pressure
+\end{center}
+
+After:
+
+\begin{center}
+large intermediate tensors \(\rightarrow\) external DDR scratch buffers
+\end{center}
+
+This reduced BRAM/LUT pressure enough for the design to become placeable.
+The cost was latency because DDR access is slower than local storage.
+
+\subsection{Second Fix: Specialized Hot Kernels}
+
+The next version specialized common operations:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item a dedicated image convolution for the first layer,
+  \item a dedicated 1 by 1 convolution kernel,
+  \item local weight caching,
+  \item two output channels at a time for pointwise convolution.
+\end{itemize}
+
+This reduced repeated memory work and made the design more direct.
+
+\subsection{Final Fix: Integer MAC Arithmetic}
+
+The final \code{hls\_ddr\_intmac} version changed the arithmetic model in the convolution-heavy parts.
+
+Instead of repeatedly converting int16 values into fixed-point objects in the inner loops, it keeps the hot path as integer multiply-accumulate:
+
+\begin{lstlisting}
+acc += (ap_int<48>)in_value * (ap_int<48>)weight;
+\end{lstlisting}
+
+Then it performs one rounded shift and saturation at the end.
+
+This improved both speed and resource use because:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item integer multiplies map cleanly to DSPs,
+  \item less fixed-point conversion logic is generated,
+  \item fewer LUTs are needed around arithmetic,
+  \item the math still matches the quantized model closely.
+\end{itemize}
+
+The slightly surprising result was that the design became faster while also using fewer LUTs.
+That is not dubious.
+It happens when a rewrite gives HLS a simpler hardware structure to synthesize.
+
+\section{Processor-Side Runtime}
+
+\subsection{What the ARM Processor Does}
+
+On a PYNQ/Zynq board, the system has:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item PS: Processing System, the ARM processor running Linux/Python,
+  \item PL: Programmable Logic, the FPGA fabric containing the HLS IP.
+\end{itemize}
+
+The processor handles all high-level application logic:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item load the bitstream,
+  \item allocate physically contiguous buffers,
+  \item load \code{weights.bin},
+  \item configure the HLS IP registers,
+  \item capture camera frames,
+  \item detect/crop faces,
+  \item resize and format the image,
+  \item start the accelerator,
+  \item read the embedding,
+  \item compare against authorized embeddings.
+\end{itemize}
+
+The FPGA handles the CNN math.
+
+\subsection{Why Physical Addresses Matter}
+
+Python objects normally have virtual addresses.
+The FPGA cannot use normal Python object addresses.
+The FPGA needs physical DDR addresses.
+
+That is why PYNQ uses \code{allocate}.
+It creates buffers that:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item Python can read and write,
+  \item the FPGA can access through physical addresses,
+  \item can be flushed and invalidated for cache coherency.
+\end{itemize}
+
+The runtime writes physical addresses into the HLS IP:
+
+\begin{lstlisting}
+write_u64(ip, IMAGE_OFFSET, image_buf.physical_address)
+write_u64(ip, WEIGHTS_OFFSET, weights_buf.physical_address)
+write_u64(ip, SCRATCH0_OFFSET, scratch0.physical_address)
+...
+\end{lstlisting}
+
+\subsection{Flush and Invalidate}
+
+Flush and invalidate are cache-coherency operations.
+
+\begin{description}[leftmargin=2.8em,style=nextline]
+  \item[Flush]
+  Push CPU-written data out to DDR so the FPGA sees the latest values.
+  The image buffer and weights buffer must be flushed before the IP reads them.
+
+  \item[Invalidate]
+  Discard stale CPU cache lines so Python reads fresh data from DDR after the FPGA writes it.
+  The output buffer must be invalidated after the IP finishes.
+\end{description}
+
+Without these operations, the accelerator might read old data or Python might read old output.
+
+\subsection{Starting the IP}
+
+The HLS control register is written with \code{0x01} to set \code{ap\_start}.
+Then Python polls until \code{ap\_done} is set:
+
+\begin{lstlisting}
+ip.write(CTRL_OFFSET, 0x01)
+while (ip.read(CTRL_OFFSET) & 0x2) == 0:
+    pass
+\end{lstlisting}
+
+This is a blocking call.
+The Python code waits there until the CNN finishes.
+
+\section{Camera and Verification Flow}
+
+\subsection{Live Frame Flow}
+
+The live notebook/script flow is:
+
+\begin{enumerate}[leftmargin=1.6em]
+  \item Open DroidCam/OpenCV video stream.
+  \item Grab frames in a thread or loop.
+  \item Throttle detection so face detection does not run every single frame.
+  \item Detect the largest face with Haar cascade.
+  \item Crop the face region.
+  \item Convert BGR to RGB because OpenCV uses BGR but the model expects RGB.
+  \item Resize to 112 by 112.
+  \item Flatten into HWC RGB uint8 layout.
+  \item Run the HLS CNN IP.
+  \item Convert int16 embedding output back to float.
+  \item Compare with authorized embeddings.
+\end{enumerate}
+
+\subsection{Detection Throttling}
+
+Face detection is not run on every loop iteration.
+It is throttled using a frame counter, for example:
+
+\begin{lstlisting}
+if frame_count % DETECTION_EVERY == 0:
+    last_detections = detect_and_embed_hls(frame)
+\end{lstlisting}
+
+The reason is simple:
+Haar detection and CNN inference are expensive compared with just reading a frame.
+Throttling lets the live loop stay responsive.
+The last known detection can be reused between detection intervals.
+
+\subsection{No-Face Case}
+
+When no face is detected, the application can still run a dummy cosine comparison.
+That is not for recognition accuracy.
+It is useful when testing that the cosine IP path is alive and returns a low score.
+
+The dummy vectors can be orthogonal:
+
+\[
+  a = [1,0,0,\ldots], \quad b = [0,1,0,\ldots]
+\]
+
+Their dot product is zero, so the match result should be low.
+
+\section{Cosine Similarity Accelerator}
+
+\subsection{Software Cosine}
+
+The simplest cosine check is done in NumPy:
+
+\begin{lstlisting}
+score = float(np.dot(cam_emb, auth_emb))
+match = score >= MATCH_THRESHOLD
+\end{lstlisting}
+
+Because embeddings are normalized, dot product equals cosine similarity.
+
+\subsection{Hardware Cosine}
+
+The separate cosine similarity IP replaces the software dot product.
+The CNN still produces the embedding.
+The cosine IP compares that embedding against authorized embeddings.
+
+Conceptually:
+
+\begin{center}
+\code{camera embedding} + \code{authorized embedding}
+\(\rightarrow\)
+\code{cosine score} + \code{match bit}
+\end{center}
+
+This is a clean split:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item TinyFaceMatch IP computes embeddings.
+  \item Cosine IP computes match scores.
+  \item Python controls the loop and threshold policy.
+\end{itemize}
+
+\section{Measured Final Behavior}
+
+\subsection{Hardware Latency}
+
+The final board measurement reported:
+
+\begin{center}
+\begin{tabular}{llllll}
+\toprule
+Measurement & Runs & Min & Mean & P95 & Max \\
+\midrule
+CNN only & 20 & 1287.00 ms & 1287.28 ms & 1287.45 ms & 1290.65 ms \\
+Full embedding & 20 & 1288.31 ms & 1288.66 ms & 1288.85 ms & 1292.07 ms \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The difference between CNN-only and full embedding is about:
+\[
+  1288.66 - 1287.28 = 1.38 \text{ ms}
+\]
+
+That means almost all the runtime is inside the HLS CNN IP.
+The Python buffer setup, output conversion, and final normalization are tiny compared with the CNN itself.
+
+\subsection{Accuracy Sanity Check}
+
+The integer-MAC version passed simulation with:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item max int16 output error around 16,
+  \item mean int16 output error around 4.7,
+  \item cosine to expected around 0.999991.
+\end{itemize}
+
+That means the quantized HLS math tracks the expected embedding direction extremely closely.
+For face verification, preserving the direction of the embedding is more important than matching every raw component exactly.
+
+\subsection{Resource Direction}
+
+The final int-MAC version used roughly:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item BRAM\_18K: 10,
+  \item DSP: 50,
+  \item FF: about 16.7k,
+  \item LUT: about 27k.
+\end{itemize}
+
+This is the key achievement:
+the implementation became viable for the FPGA while keeping accuracy.
+
+\section{Implementation Thought Process}
+
+\subsection{Step 1: Make the Model Exportable}
+
+The model had to be written in a way that could be represented statically.
+That means:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item fixed input size,
+  \item fixed channel sizes,
+  \item common convolution blocks,
+  \item no dynamic Python-side control inside inference,
+  \item output dimension fixed at 128.
+\end{itemize}
+
+This made it possible to manually map the network into HLS.
+
+\subsection{Step 2: Remove Training-Only Operations}
+
+The ArcFace classifier is useful for training but irrelevant for FPGA inference.
+BatchNorm is useful in training but can be folded away for inference.
+
+So the deployed model is not the training model exactly.
+It is the inference backbone after BatchNorm folding and quantization.
+
+\subsection{Step 3: Quantize in a Controlled Way}
+
+Quantization was not left to the HLS compiler.
+It was done explicitly in Python so the exact numeric format was known:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item weights Q12,
+  \item biases Q20,
+  \item activations Q10,
+  \item output Q14.
+\end{itemize}
+
+This made it possible to reason about the arithmetic and build the integer-MAC design.
+
+\subsection{Step 4: Use DDR for Large Tensors}
+
+The failed resource-heavy version showed that large intermediate tensors could not live comfortably on-chip.
+The design was changed to make DDR scratch buffers part of the interface.
+
+This was the biggest architectural pivot.
+It traded memory bandwidth and latency for a design that actually fits.
+
+\subsection{Step 5: Optimize the Real Hot Path}
+
+The important runtime cost is convolution.
+So the final optimization focused on:
+
+\begin{itemize}[leftmargin=1.4em]
+  \item avoiding unnecessary fixed-point object math in convolution loops,
+  \item caching small weight slices locally,
+  \item specializing 1 by 1 convolution,
+  \item processing two pointwise output channels at a time.
+\end{itemize}
+
+Dense output and Python overhead were not the main bottlenecks, so they were not over-optimized first.
+
+\section{Limitations and Future Improvement Paths}
+
+\subsection{Current Main Limitation}
+
+The current accelerator is viable and accurate, but the CNN still takes about 1.29 seconds per embedding on the measured board setup.
+That means the live system should throttle inference and cannot treat the CNN as a high-frame-rate accelerator yet.
+
+\subsection{Potential Improvements}
+
+\begin{description}[leftmargin=2.8em,style=nextline]
+  \item[More parallel output channels]
+  \code{run\_conv1x1} currently processes two output channels at a time.
+  More parallelism could improve latency but would consume more DSPs and memory bandwidth.
+
+  \item[Better local tiling]
+  Instead of reading/writing large DDR feature maps in straightforward order, selected tiles could be kept on-chip.
+  This is harder to implement but could reduce DDR traffic.
+
+  \item[More aggressive layer fusion]
+  Some producer/consumer layer pairs might be fused so intermediate results do not always round-trip to DDR.
+  This is complex because the model has residuals and changing spatial sizes.
+
+  \item[Smaller model variant]
+  Reducing channels or blocks would directly reduce CNN latency.
+  The cost would be accuracy and embedding quality.
+
+  \item[Multiple accelerators or larger FPGA]
+  A larger device would allow more parallelism and more on-chip buffering.
+\end{description}
+
+\section{Final Mental Model}
+
+The implementation can be understood as a carefully constrained translation:
+
+\begin{center}
+\fbox{\begin{minipage}{0.88\linewidth}
+PyTorch learns a compact face embedding model.
+The conversion script folds BatchNorm, quantizes the learned parameters, and packs them into a flat memory image.
+The HLS IP is a static hardware implementation of that exact model.
+It uses DDR scratch buffers to store intermediate tensors because the FPGA fabric cannot hold all feature maps on-chip.
+The final integer-MAC kernels exploit the known quantization format to make convolution hardware simpler, faster, and smaller.
+The PYNQ Python side owns the application: camera input, face detection, buffer management, accelerator control, and match decisions.
+\end{minipage}}
+\end{center}
+
+\end{document}

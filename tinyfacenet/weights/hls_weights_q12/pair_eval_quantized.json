@@ -1,0 +1,22 @@
+{
+  "threshold": 0.12999999523162842,
+  "accuracy": 0.7848,
+  "tpr": 0.7468,
+  "fpr": 0.1772,
+  "precision": 0.8082251082251082,
+  "eer_threshold": 0.11299999803304672,
+  "eer": 0.22139999999999999,
+  "same_mean": 0.2596113085746765,
+  "same_std": 0.1846499890089035,
+  "diff_mean": 0.016218865290284157,
+  "diff_std": 0.12551483511924744,
+  "embedding_max_abs_error": 0.001925744116306305,
+  "embedding_mean_abs_error": 0.000280424515850391,
+  "embedding_mean_cosine_to_pytorch": 0.9999919928823882,
+  "prepared_dir": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\runs\\tinyfacematch128_w05_v4_continue\\hls_weights_q12",
+  "checkpoint": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\runs\\tinyfacematch128_w05_v4_continue\\last.pt",
+  "data_dir": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\CASIA_subset_500x25",
+  "pairs": 10000,
+  "same_pairs": 5000,
+  "diff_pairs": 5000
+}

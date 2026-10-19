@@ -1,0 +1,8 @@
+[
+  {
+    "index": 0,
+    "source": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\CASIA_subset_500x25\\0000168\\0000.jpg",
+    "input": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\hls\\test_vectors\\input_0.bin",
+    "expected": "C:\\ramse\\hls4ml_projects\\tinyFaceNet\\hls\\test_vectors\\expected_0.bin"
+  }
+]
