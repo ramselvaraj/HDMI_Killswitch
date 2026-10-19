@@ -6,8 +6,20 @@ a cosine-similarity IP, both in the fabric, decide whether the HDMI stream passe
 through or the monitor goes black. Sync is always forwarded so the monitor stays
 locked, and an on-screen banner shows AUTHORIZED / NOT AUTHORIZED.
 
-![authorized](media/demo_authorized.jpg)
-![not authorized](media/demo_not_authorized.jpg)
+## Demo
+
+Live on the PYNQ-Z2. The dashboard scores the camera face and the HDMI output is
+gated accordingly (match threshold 65%).
+
+| Authorized | Not authorized |
+|:---:|:---:|
+| <img src="media/demo_authorized.jpg" width="400"> | <img src="media/demo_not_authorized.jpg" width="400"> |
+| Match score 0.87: video passes through, green AUTHORIZED banner | Match score 0.51: screen blacked out, red NOT AUTHORIZED banner |
+
+<p align="center">
+  <img src="media/web_ui_match.png" width="700"><br>
+  <em>Web dashboard: live camera, match decision, score, enrollment and threshold controls</em>
+</p>
 
 Demo video: [`media/demo.mp4`](media/demo.mp4)
 
@@ -34,8 +46,6 @@ camera -> tinyFaceNet CNN IP -> 128-d embedding -> cosine_sim_axi vs. enrolled -
 | CNN inference on PYNQ | ~691 ms |
 | Cosine match | ~13 ms |
 | Scores at 65% threshold | 0.87 authorized, 0.51 rejected |
-
-![web UI](media/web_ui_match.png)
 
 ## Layout
 
