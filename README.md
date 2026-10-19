@@ -15,6 +15,20 @@ PC --HDMI--> [ dvi2rgb -> auth gate / overlay -> rgb2dvi ] --HDMI--> Monitor
                               -> cosine-similarity IP vs. enrolled -> auth bit
 ```
 
+## Demo
+
+Live on the PYNQ-Z2 (2026-05-27): the Flask dashboard scores the camera face with
+tinyFaceNet + the cosine IP, and the HDMI output is gated accordingly.
+Threshold 65%. Same face scored 0.87 (authorized) and 0.51 (not authorized).
+
+| Authorized | Not authorized |
+|---|---|
+| ![authorized](media/demo_authorized.jpg) | ![not authorized](media/demo_not_authorized.jpg) |
+
+![web UI](media/web_ui_match.png)
+
+Video: [`media/demo.mp4`](media/demo.mp4) (1080p, 13 MB).
+
 ## Repository layout
 
 ```text
@@ -47,7 +61,8 @@ design, `.bd` and/or exported Tcl) and `hw/` (`.bit`, `.hwh`, `.xsa`).
 | tinyFaceNet, first HLS version | 205,926 LUT: cannot be placed on the 53k-LUT part |
 | tinyFaceNet, DDR-scratch version | 39,350 LUT |
 | tinyFaceNet, final integer-MAC | **27,004 LUT, 50 DSP, 10 BRAM_18K**; cosine 0.99999 vs. reference |
-| Embedding latency on PYNQ | ~1,287 ms, nearly all in the CNN accelerator (the weak spot) |
+| Embedding latency on PYNQ | ~1,287 ms (earlier measurement), nearly all in the CNN accelerator |
+| Web UI runtime panel (2026-05-27) | CNN 691 ms, Haar detect 523-613 ms, cosine 13 ms, loop 330 ms, **8.3 FPS** |
 
 The XDC files declare the HDMI pixel clock and fabric clock as asynchronous
 (`set_clock_groups -asynchronous`). The auth bit is double-flop synchronized into
@@ -103,5 +118,6 @@ Vivado project copies.
 
 ## Status / known gaps
 
-Ran end to end on the PYNQ-Z2 with a real monitor. Embedding latency (~1.3 s) is
-the main thing to improve. The demo video is not in this repo.
+Ran end to end on the PYNQ-Z2 with a real monitor (see Demo). Per-frame cost is
+now dominated by the CNN (~0.7 s) and the CPU-side Haar face detector (~0.5-0.6 s),
+which is also the weakest part for accuracy (off-angle / low-light faces).
