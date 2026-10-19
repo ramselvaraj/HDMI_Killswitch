@@ -29,6 +29,7 @@ tinyfacenet/           the face-embedding CNN that feeds the gate
   model/                 PyTorch model, training, ONNX export, HLS weight prep, eval
   hls/                   Vitis HLS integer-MAC IP (hls_ddr_intmac) + test vectors
   host/                  PYNQ Flask demo (camera, enrollment, match loop, dashboard)
+                         + cosine_driver.py (MMIO driver for the cosine_sim_axi IP)
   scripts/               test-vector export, on-board verification
   weights/               final trained weights, ONNX, Q12 HLS weights, eval JSONs
   docs/                  system report, deep dive, LaTeX/PDF implementation report
@@ -80,6 +81,17 @@ absolute paths from the author's machine (e.g. `/mnt/OS/...`, `runs/...`);
 adjust them to this layout (`tinyfacenet/weights/hls_weights_q12/weights.bin`).
 `host/app.py` defaults to the bitstream name `hvCNN_q8.bit`; the final design
 is `system/hw/hvCNN_INT.bit` (+ `.hwh`), so pass or set that.
+
+## Software drivers (MMIO)
+
+- `tinyfacenet/host/cosine_driver.py`: Python class `CosineSimilarity` for the
+  `cosine_sim_axi` IP (register map in its docstring: CTRL, STATUS, THRESHOLD in
+  Q2.30, vector select/data in Q1.15).
+- `tinyfacenet/host/app.py`: drives the tinyFaceNet HLS IP directly over MMIO via
+  PYNQ (`ip.write`/`ip.read` on the CTRL/image/weights/scratch/out pointer
+  registers) and DMA buffers from `pynq.allocate`.
+- The HDMI auth bit itself is set from software over a GPIO/AXI register in the
+  block designs under `hdmi/03_auth_gate` and `system/`.
 
 ## What is committed vs. not
 
